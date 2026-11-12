@@ -12,6 +12,7 @@ import pytest
 import aqt
 from anki.sound import SoundOrVideoTag
 from anki.utils import is_lin, is_mac, is_win
+from aqt.mpv import MPV
 from aqt.sound import MpvManager, _packagedCmd, is_audio_file
 
 
@@ -123,3 +124,122 @@ def test_mpvmanager_can_play_generated_wav(
     monkeypatch.setattr(aqt, "mw", mock_mw)
     manager = MpvManager(tmp_path, tmp_path)
     manager.play(SoundOrVideoTag(filename=str(generated_wav.name)), lambda _: None)
+
+
+def _mpv_with_callbacks(callbacks: dict) -> MPV:
+    # Skip __init__ so no mpv process or background registration is started.
+    player = MPV.__new__(MPV)
+    player._callbacks_initialized = True
+    player._callbacks = callbacks
+    return player
+
+
+def _failing_callback(*args) -> None:
+    raise RuntimeError("callback failed")
+
+
+@pytest.mark.parametrize(
+    "callback_name, message, expected",
+    [
+        ("file-loaded", {"event": "file-loaded"}, ("handled",)),
+        (
+            "property-idle-active",
+            {"event": "property-change", "name": "idle-active", "data": True},
+            ("handled", True),
+        ),
+    ],
+)
+def test_mpv_event_runs_remaining_callbacks_when_one_raises(
+    capsys, callback_name: str, message: dict, expected: tuple
+):
+    calls = []
+    player = _mpv_with_callbacks(
+        {
+            callback_name: [
+                _failing_callback,
+                lambda *args: calls.append(("handled", *args)),
+            ]
+        }
+    )
+
+    player._handle_event(message)
+
+    assert calls == [expected]
+    assert "callback failed" in capsys.readouterr().err
+
+
+class _StopEventReader(BaseException):
+    """Ends the otherwise endless event loop; not an Exception, so the
+    per-callback guard cannot swallow it."""
+
+
+def test_mpv_event_thread_keeps_dispatching_after_a_callback_raises(capsys):
+    calls = []
+
+    def fail_on_first_load() -> None:
+        if not calls:
+            calls.append("failed")
+            raise RuntimeError("callback failed")
+        calls.append("loaded")
+
+    player = _mpv_with_callbacks({"file-loaded": [fail_on_first_load]})
+    events = iter([{"event": "file-loaded"}, None, {"event": "file-loaded"}])
+
+    def next_event(timeout=None):
+        try:
+            return next(events)
+        except StopIteration:
+            raise _StopEventReader
+
+    player._get_event = next_event
+
+    with pytest.raises(_StopEventReader):
+        player._event_reader()
+
+    assert calls == ["failed", "loaded"]
+    assert "callback failed" in capsys.readouterr().err
+
+
+def _mpvmanager_with_completion(on_done) -> MpvManager:
+    # Skip __init__ so no mpv process is started.
+    manager = MpvManager.__new__(MpvManager)
+    manager._on_done = on_done
+    return manager
+
+
+def test_mpvmanager_idle_does_not_raise_when_main_window_cleared(monkeypatch):
+    manager = _mpvmanager_with_completion(MagicMock())
+    monkeypatch.setattr(aqt, "mw", None)
+
+    # mpv can report idle after shutdown has cleared the main window; this
+    # must not raise into the event thread.
+    manager.on_property_idle_active(True)
+
+
+def test_mpvmanager_idle_runs_completion_on_main_thread(monkeypatch):
+    on_done = MagicMock()
+    manager = _mpvmanager_with_completion(on_done)
+    mock_mw = MagicMock()
+    monkeypatch.setattr(aqt, "mw", mock_mw)
+
+    manager.on_property_idle_active(True)
+
+    mock_mw.taskman.run_on_main.assert_called_once_with(on_done)
+    on_done.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "idle, on_done",
+    [(False, MagicMock()), (True, None)],
+    ids=["playing", "no_completion"],
+)
+def test_mpvmanager_idle_schedules_nothing_when_playing_or_no_completion(
+    monkeypatch, idle: bool, on_done
+):
+    manager = _mpvmanager_with_completion(on_done)
+    mock_mw = MagicMock()
+    monkeypatch.setattr(aqt, "mw", mock_mw)
+
+    manager.on_property_idle_active(idle)
+
+    mock_mw.taskman.run_on_main.assert_not_called()
